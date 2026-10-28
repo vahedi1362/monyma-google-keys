@@ -1,0 +1,122 @@
+# Keep google_certs.json equal to Google's public sign-in keys.
+#
+# This repository is public on purpose: GitHub Actions minutes are free and
+# unlimited for a public repository, so this job runs every hour at no cost,
+# while monyma-server's own job (private repository) stops when the month's
+# minutes run out. The Monyma server inside Iran reads this file as its
+# «آینه‌ی کلیدهای گوگل» (auth.google.certs_mirror_url) when it cannot reach
+# Google. The keys are public; nothing secret is here — and must never be.
+#
+# The server trusts the keys in this file to check «ادامه با گوگل», so the
+# file is only ever written from Google's own answer, never by hand.
+
+name: Google sign-in keys
+
+on:
+  schedule:
+    - cron: "23 * * * *" # every hour, off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: google-certs
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Google's keys and write them when they changed
+        id: refresh
+        run: |
+          set -euo pipefail
+          file="google_certs.json"
+          url="https://www.googleapis.com/oauth2/v3/certs"
+
+          headers="$(mktemp)"
+          body="$(mktemp)"
+          curl -fsS --proto '=https' --retry 3 --retry-delay 5 -D "$headers" -o "$body" "$url"
+          max_age="$(grep -i '^cache-control:' "$headers" \
+            | grep -oiE 'max-age=[0-9]+' | head -n1 | cut -d= -f2 || true)"
+          [ -n "${max_age:-}" ] || max_age=21600
+
+          python3 - "$file" "$body" "$url" "$max_age" <<'PY'
+          import json, os, sys, datetime, pathlib
+
+          path, body_path, url, max_age = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+          now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+          fetched = json.load(open(body_path))
+          keys = []
+          for k in fetched.get("keys", []):
+              if k.get("kty") != "RSA" or not k.get("kid") or not k.get("n") or not k.get("e"):
+                  continue
+              keys.append({
+                  "kid": k["kid"], "kty": k["kty"], "alg": k.get("alg", "RS256"),
+                  "use": k.get("use", "sig"), "n": k["n"], "e": k["e"],
+              })
+          if not keys:
+              print("no RSA keys in Google's answer; leaving the file as it is")
+              sys.exit(0)
+          keys.sort(key=lambda k: k["kid"])
+
+          def key_set(obj):
+              return sorted(
+                  ((k.get("kid"), k.get("n"), k.get("e")) for k in obj.get("keys", [])),
+                  key=lambda t: t[0] or "",
+              )
+
+          old = {}
+          p = pathlib.Path(path)
+          if p.exists():
+              try:
+                  old = json.loads(p.read_text())
+              except Exception:
+                  old = {}
+
+          # A commit at least every 30 days even when the keys stay the same:
+          # GitHub turns a public repository's schedule off after 60 days with
+          # no activity.
+          stale = True
+          try:
+              then = datetime.datetime.fromisoformat(old["fetched_at"].replace("Z", "+00:00"))
+              stale = now - then > datetime.timedelta(days=30)
+          except Exception:
+              pass
+
+          changed = key_set(old) != key_set({"keys": keys})
+          write = changed or stale
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+              gh.write(f"write={'true' if write else 'false'}\n")
+          if not write:
+              print("Google's keys are unchanged; nothing to commit")
+              sys.exit(0)
+
+          wrapper = {
+              "url": url,
+              "fetched_at": now.isoformat().replace("+00:00", "Z"),
+              "max_age_seconds": max_age,
+              "keys": keys,
+          }
+          p.write_text(json.dumps(wrapper, indent=2, ensure_ascii=False) + "\n")
+          print(f"wrote {len(keys)} keys ({'changed' if changed else 'unchanged, 30 days old'})")
+          PY
+
+      - name: Commit the new keys
+        if: steps.refresh.outputs.write == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add google_certs.json
+          git commit -m "Google sign-in: Google's current public keys"
+          git push
+
+      - name: Tell jsDelivr the file changed
+        if: steps.refresh.outputs.write == 'true'
+        continue-on-error: true
+        run: curl -fsS --retry 2 "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/google_certs.json" || true
