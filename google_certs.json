@@ -1,7 +1,7 @@
 {
   "url": "https://www.googleapis.com/oauth2/v3/certs",
-  "fetched_at": "2026-09-01T00:00:00Z",
-  "max_age_seconds": 21600,
+  "fetched_at": "2026-10-28T07:22:23Z",
+  "max_age_seconds": 22049,
   "keys": [
     {
       "kid": "943a3a5d7d919625a454e489b75c29adab57acba",
